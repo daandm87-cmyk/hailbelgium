@@ -58,10 +58,10 @@ PLOT_EXTENT = [2.4, 6.5, 49.4, 51.6]  # what the map actually shows
 # FORMULA COEFFICIENTS  -- all uncalibrated first guesses, tune these
 # --------------------------------------------------------------------------
 SIZE_MAX_CM  = 8.0     # max "aloft" size an extreme environment can reach
-CAPE_SCALE   = 1500.0  # J/kg; capacity saturates on this scale
+LI_SCALE     = 4.0     # deg C; growth-zone buoyancy (Best LI) saturates on this
 LR_MIN       = 5.5     # deg C/km; below this, mid-level lapse rate adds nothing
 LR_REF       = 8.0     # deg C/km; at/above this, full lapse-rate credit
-LR_WEIGHT    = 0.5     # capacity floor from CAPE alone (0..1); rest from lapse rate
+LR_WEIGHT    = 0.5     # capacity floor from buoyancy alone (0..1); rest from lapse rate
 
 SHEAR_SCALE  = 18.0    # m/s; organization efficiency saturates on this scale
 ORG_FLOOR    = 0.55    # disorganized storms still realize this fraction
@@ -84,17 +84,24 @@ def _first(ds):
     return ds[list(ds.data_vars)[0]]
 
 
-def _mucape(H):
-    """Most-unstable CAPE, with a surface-CAPE fallback if MU isn't present."""
-    for s in (":CAPE:255-0 mb above ground:",
-              ":CAPE:180-0 mb above ground:",
-              ":CAPE:surface:"):
+def _best_li(H):
+    """
+    Best (4-layer) Lifted Index from GFS -- the most-unstable parcel's buoyancy
+    referenced to 500 hPa (~ -12 to -18 C over Belgium in convective season),
+    i.e. buoyancy weighted toward the hail GROWTH ZONE. This is the GFS-native
+    analogue of Groenemeijer's MU_LI_10 and a far better hail-capacity proxy
+    than MUCAPE, which is inflated by low-level (sub-growth-zone) buoyancy.
+    Negative = unstable. Falls back to surface LFTX if 4LFTX is absent.
+    """
+    for s in (":4LFTX:180-0 mb above ground:",
+              ":4LFTX:",
+              ":LFTX:500-1000 mb:",
+              ":LFTX:"):
         try:
-            da = _first(_ds(H, s))
-            return da
+            return _first(_ds(H, s))
         except Exception:
             continue
-    raise RuntimeError("No CAPE field found in GFS file.")
+    raise RuntimeError("No Lifted Index field found in GFS file.")
 
 
 # --------------------------------------------------------------------------
@@ -108,16 +115,16 @@ def compute(run, fxx):
             f"GFS {run:%Y-%m-%d %H}Z f{fxx:03d} not available yet. "
             f"If you ran this too soon after 00Z, wait until ~05-06Z.")
 
-    cape_da = _mucape(H)
-    lat = cape_da.latitude.values
-    lon = cape_da.longitude.values
+    li_da = _best_li(H)
+    lat = li_da.latitude.values
+    lon = li_da.longitude.values
     ila = np.where((lat >= LAT_MIN) & (lat <= LAT_MAX))[0]
     ilo = np.where((lon >= LON_MIN) & (lon <= LON_MAX))[0]
 
     def C(a):
         return np.asarray(a)[np.ix_(ila, ilo)]
 
-    mucape = C(cape_da.values)                                   # J/kg
+    best_li = C(li_da.values)                                    # deg C, neg = unstable
 
     t = _first(_ds(H, ":TMP:(500|700) mb:"))
     t500 = C(t.sel(isobaricInhPa=500).values) - 273.15           # deg C
@@ -138,10 +145,12 @@ def compute(run, fxx):
     fz_agl = np.maximum(fz_msl - orog, 0.0)                      # m AGL
 
     # ---- THE FORMULA --------------------------------------------------
-    # Capacity: saturating in CAPE, emphasised by mid-level lapse rate.
-    cape_term = 1.0 - np.exp(-mucape / CAPE_SCALE)               # 0..1
+    # Capacity: growth-zone buoyancy (Best LI). Gate CLOSES where the column
+    # is stable to 500 hPa (LI >= 0); saturates as LI gets strongly negative.
+    # Emphasised by mid-level lapse rate.
+    buoy_term = 1.0 - np.exp(np.minimum(best_li, 0.0) / LI_SCALE)  # 0..1, 0 if LI>=0
     lr_term = np.clip((lr75 - LR_MIN) / (LR_REF - LR_MIN), 0.0, 1.0)
-    capacity = SIZE_MAX_CM * cape_term * (LR_WEIGHT + (1 - LR_WEIGHT) * lr_term)
+    capacity = SIZE_MAX_CM * buoy_term * (LR_WEIGHT + (1 - LR_WEIGHT) * lr_term)
 
     # Efficiency: organization via deep-layer shear, floored + saturating.
     eff = ORG_FLOOR + (1 - ORG_FLOOR) * np.tanh(shear06 / SHEAR_SCALE)
@@ -174,7 +183,7 @@ def plot(size, lat, lon, run, fxx, outpath):
     masked = np.where(size >= PLOT_FLOOR_CM, size, np.nan)
 
     fig = plt.figure(figsize=(9, 8))
-    ax = plt.axes(projection=ccrs.PlateCarree())
+    ax = plt.axes(projection=ccrs.Mercator())   # conformal: fixes the lat squish
     ax.set_extent(PLOT_EXTENT, crs=ccrs.PlateCarree())
 
     cf = ax.contourf(lon, lat, masked, levels=levels, cmap=cmap, norm=norm,
@@ -216,8 +225,8 @@ def plot(size, lat, lon, run, fxx, outpath):
         f"Run {run:%Y-%m-%d %H}Z   valid {valid:%Y-%m-%d %H}Z   (f{fxx:03d})",
         fontsize=12)
     ax.text(0.5, -0.13,
-            "Cool 1-2 cm (sub-severe) | warm 2-5 cm (severe) | hot >=5 cm "
-            "(very large).  Coefficients are first guesses, not tuned to reports.",
+            "Buoyancy = Best Lifted Index (growth-zone).  Cool 1-2 cm | warm "
+            "2-5 cm (severe) | hot >=5 cm.  Coefficients are first guesses.",
             transform=ax.transAxes, ha="center", fontsize=8, style="italic")
 
     os.makedirs(os.path.dirname(outpath), exist_ok=True)
