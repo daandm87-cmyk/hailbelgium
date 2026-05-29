@@ -1,1 +1,64 @@
+name: Belgium hail map
 
+# Run it from your phone with the "Run workflow" button (workflow_dispatch),
+# and automatically every morning once the 00Z GFS run has finished.
+on:
+  workflow_dispatch:        # manual trigger (the button)
+    inputs:
+      run_date:
+        description: "GFS run date YYYY-MM-DD (blank = today UTC)"
+        required: false
+        default: ""
+  schedule:
+    - cron: "0 6 * * *"     # 06:00 UTC daily; 00Z GFS f015 is out well before this
+
+permissions:
+  contents: write           # needed to commit output/latest.png back to the repo
+
+jobs:
+  build-map:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: System libraries (eccodes / geos / proj for cfgrib + cartopy)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libeccodes0 libgeos-dev libproj-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build the map
+        env:
+          RUN_HOUR: "0"
+          VALID_HOUR: "15"
+          RUN_DATE: ${{ github.event.inputs.run_date }}
+        run: python belgium_hail_map.py
+
+      - name: Upload PNG as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: belgium-hail-map
+          path: output/*.png
+          if-no-files-found: error
+
+      - name: Commit latest.png back to the repo (for easy phone viewing)
+        run: |
+          git config user.name  "hail-map-bot"
+          git config user.email "actions@github.com"
+          git add output/*.png
+          if git diff --cached --quiet; then
+            echo "No change to commit."
+          else
+            git commit -m "Update Belgium hail map ($(date -u +%Y-%m-%dT%H:%MZ))"
+            git push
+          fi
