@@ -15,6 +15,11 @@ on:
 permissions:
   contents: write           # needed to commit output/latest.png back to the repo
 
+# Only one run at a time, so runs can't race each other to push to main.
+concurrency:
+  group: belgium-hail-map
+  cancel-in-progress: false  # queue a second trigger rather than killing a run mid-download
+
 jobs:
   build-map:
     runs-on: ubuntu-latest
@@ -58,7 +63,19 @@ jobs:
           git add output/*.png
           if git diff --cached --quiet; then
             echo "No change to commit."
-          else
-            git commit -m "Update Belgium hail map ($(date -u +%Y-%m-%dT%H:%MZ))"
-            git push
+            exit 0
           fi
+          git commit -m "Update Belgium hail map ($(date -u +%Y-%m-%dT%H:%MZ))"
+          # Remote may have advanced (another run, or a source edit). Try to
+          # push; if rejected, rebase our commit onto the latest remote and retry.
+          for attempt in 1 2 3 4 5; do
+            if git push; then
+              echo "Pushed on attempt $attempt."
+              exit 0
+            fi
+            echo "Push rejected; syncing with remote (attempt $attempt)..."
+            git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+            sleep 3
+          done
+          echo "Could not push after 5 attempts." >&2
+          exit 1
